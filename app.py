@@ -6,7 +6,9 @@ import qrcode
 from flask import Flask, render_template, request, redirect, url_for, flash, session, send_file
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
-from datetime import datetime
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from datetime import datetime, timedelta
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -19,6 +21,19 @@ db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
+# Initialize rate limiter
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"],
+    storage_uri="memory://"
+)
+
+# Rate limiting constants
+LOCKOUT_THRESHOLD = 5
+LOCKOUT_TIME = timedelta(minutes=15)
+FAILED_LOGIN_RESET_TIME = timedelta(hours=1)  # Reset failed login counter after 1 hour
+
 # User Model
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -27,6 +42,13 @@ class User(UserMixin, db.Model):
     totp_secret = db.Column(db.String(32), nullable=True)
     is_2fa_enabled = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # Rate limiting and brute-force protection fields
+    failed_logins = db.Column(db.Integer, default=0)
+    last_failed_login = db.Column(db.DateTime, nullable=True)
+    account_locked_until = db.Column(db.DateTime, nullable=True)
+    failed_2fa_attempts = db.Column(db.Integer, default=0)
+    last_failed_2fa = db.Column(db.DateTime, nullable=True)
     
     def set_password(self, password):
         """Hash and set the user's password"""
@@ -59,6 +81,30 @@ class User(UserMixin, db.Model):
 def load_user(user_id):
     return User.query.get(int(user_id))
 
+# Helper functions
+def is_account_locked(user):
+    """Check if a user account is currently locked"""
+    if user.account_locked_until and user.account_locked_until > datetime.utcnow():
+        return True
+    return False
+
+def should_reset_failed_attempts(user, attempt_type='login'):
+    """Check if failed attempts should be reset based on time elapsed"""
+    if attempt_type == 'login':
+        if user.last_failed_login and (datetime.utcnow() - user.last_failed_login) > FAILED_LOGIN_RESET_TIME:
+            return True
+    elif attempt_type == '2fa':
+        if user.last_failed_2fa and (datetime.utcnow() - user.last_failed_2fa) > FAILED_LOGIN_RESET_TIME:
+            return True
+    return False
+
+def get_rate_limit_key():
+    """Get rate limit key based on username from form or IP address"""
+    username = request.form.get('username', '').strip()
+    if username:
+        return f"user:{username}"
+    return f"ip:{get_remote_address()}"
+
 # Routes
 @app.route('/')
 def index():
@@ -68,6 +114,7 @@ def index():
     return redirect(url_for('login'))
 
 @app.route('/register', methods=['GET', 'POST'])
+@limiter.limit("10 per hour", key_func=get_rate_limit_key)
 def register():
     """User registration page"""
     if current_user.is_authenticated:
@@ -108,6 +155,7 @@ def register():
     return render_template('register.html')
 
 @app.route('/login', methods=['GET', 'POST'])
+@limiter.limit("5 per minute; 20 per hour", key_func=get_rate_limit_key)
 def login():
     """User login page"""
     if current_user.is_authenticated:
@@ -119,7 +167,26 @@ def login():
         
         user = User.query.filter_by(username=username).first()
         
+        # Reset failed attempts if enough time has passed
+        if user and should_reset_failed_attempts(user, 'login'):
+            user.failed_logins = 0
+            user.last_failed_login = None
+            db.session.commit()
+        
+        # Check if account is locked (even if user doesn't exist, timing attack prevention)
+        if user and is_account_locked(user):
+            minutes_remaining = int((user.account_locked_until - datetime.utcnow()).total_seconds() / 60)
+            flash(f'Account locked due to too many failed attempts. Try again in {minutes_remaining} minutes.', 'error')
+            return render_template('login.html')
+        
+        # Verify credentials
         if user and user.check_password(password):
+            # Reset failed login attempts on successful authentication
+            user.failed_logins = 0
+            user.account_locked_until = None
+            user.last_failed_login = None
+            db.session.commit()
+            
             # If 2FA is enabled, redirect to 2FA verification
             if user.is_2fa_enabled:
                 session['pending_user_id'] = user.id
@@ -130,11 +197,26 @@ def login():
                 flash('Login successful!', 'success')
                 return redirect(url_for('dashboard'))
         else:
+            # Track failed login attempt
+            if user:
+                user.failed_logins += 1
+                user.last_failed_login = datetime.utcnow()
+                
+                # Lock account if threshold reached
+                if user.failed_logins >= LOCKOUT_THRESHOLD:
+                    user.account_locked_until = datetime.utcnow() + LOCKOUT_TIME
+                    db.session.commit()
+                    flash('Account locked due to too many failed attempts. Please try again later.', 'error')
+                    return render_template('login.html')
+                
+                db.session.commit()
+            
             flash('Invalid username or password', 'error')
     
     return render_template('login.html')
 
 @app.route('/verify-2fa', methods=['GET', 'POST'])
+@limiter.limit("5 per minute; 20 per hour", key_func=lambda: f"2fa:{session.get('pending_user_id', get_remote_address())}")
 def verify_2fa():
     """2FA verification page"""
     if current_user.is_authenticated:
@@ -151,15 +233,46 @@ def verify_2fa():
         flash('User not found', 'error')
         return redirect(url_for('login'))
     
+    # Reset failed 2FA attempts if enough time has passed
+    if should_reset_failed_attempts(user, '2fa'):
+        user.failed_2fa_attempts = 0
+        user.last_failed_2fa = None
+        db.session.commit()
+    
+    # Check if account is locked
+    if is_account_locked(user):
+        session.pop('pending_user_id', None)
+        minutes_remaining = int((user.account_locked_until - datetime.utcnow()).total_seconds() / 60)
+        flash(f'Account locked due to too many failed attempts. Try again in {minutes_remaining} minutes.', 'error')
+        return redirect(url_for('login'))
+    
     if request.method == 'POST':
         token = request.form.get('token', '').strip()
         
         if user.verify_totp(token):
+            # Reset failed 2FA attempts on success
+            user.failed_2fa_attempts = 0
+            user.last_failed_2fa = None
             session.pop('pending_user_id', None)
+            db.session.commit()
+            
             login_user(user)
             flash('Login successful!', 'success')
             return redirect(url_for('dashboard'))
         else:
+            # Track failed 2FA attempt
+            user.failed_2fa_attempts += 1
+            user.last_failed_2fa = datetime.utcnow()
+            
+            # Lock account if threshold reached
+            if user.failed_2fa_attempts >= LOCKOUT_THRESHOLD:
+                user.account_locked_until = datetime.utcnow() + LOCKOUT_TIME
+                session.pop('pending_user_id', None)
+                db.session.commit()
+                flash('Account locked due to too many failed 2FA attempts. Please try again later.', 'error')
+                return redirect(url_for('login'))
+            
+            db.session.commit()
             flash('Invalid 2FA code. Please try again.', 'error')
     
     return render_template('verify_2fa.html')
