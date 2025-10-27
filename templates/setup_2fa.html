@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}Setup 2FA - Flask 2FA App{% endblock %}
+
+{% block content %}
+<div class="auth-container">
+    <div class="auth-box setup-2fa">
+        <h2>🛡️ Enable Two-Factor Authentication</h2>
+        <p class="subtitle">Secure your account with 2FA</p>
+        
+        <div class="setup-steps">
+            <div class="step">
+                <h3>Step 1: Install an Authenticator App</h3>
+                <p>Download and install one of these apps on your phone:</p>
+                <ul>
+                    <li>Google Authenticator (iOS/Android)</li>
+                    <li>Microsoft Authenticator (iOS/Android)</li>
+                    <li>Authy (iOS/Android)</li>
+                    <li>1Password (iOS/Android)</li>
+                </ul>
+            </div>
+            
+            <div class="step">
+                <h3>Step 2: Scan QR Code</h3>
+                <p>Open your authenticator app and scan this QR code:</p>
+                <div class="qr-code">
+                    <img src="{{ url_for('get_qrcode') }}" alt="2FA QR Code">
+                </div>
+            </div>
+            
+            <div class="step">
+                <h3>Step 3: Verify Code</h3>
+                <p>Enter the 6-digit code from your authenticator app:</p>
+                <form method="POST" action="{{ url_for('setup_2fa') }}">
+                    <div class="form-group">
+                        <input type="text" id="token" name="token" required 
+                               placeholder="000000" maxlength="6" pattern="[0-9]{6}" 
+                               autocomplete="off" autofocus class="token-input">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Enable 2FA</button>
+                </form>
+            </div>
+        </div>
+        
+        <p class="auth-link">
+            <a href="{{ url_for('dashboard') }}">← Back to Dashboard</a>
+        </p>
+    </div>
+</div>
+{% endblock %}
+
